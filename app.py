@@ -55,15 +55,7 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
-
-# Keep the cookie file configurable. On Heroku, a bundled cookies.txt is
-# available in the slug when supplied with the deployment package.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COOKIES_FILE = os.getenv(
-    "COOKIE_FILE",
-    os.path.join(BASE_DIR, "cookies.txt")
-).strip()
+COOKIE_URL = os.getenv("COOKIE_URL", "")
 
 # YouTube player clients. Avoid the deprecated/problematic tv_downgraded
 # client that can cause "The page needs to be reloaded" errors.
@@ -71,17 +63,16 @@ YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
     "default,web_embedded"
 ).strip()
-YOUTUBE_PLAYER_CLIENT_LIST = [
-    c.strip() for c in YOUTUBE_PLAYER_CLIENTS.split(",") if c.strip()
-] or ["default"]
 
 # YouTube can currently downgrade logged-in cookie sessions to the
 # tv_downgraded client, which may return "The page needs to be reloaded".
 # Public music/video downloads normally do not need account cookies.
 YOUTUBE_USE_COOKIES = os.getenv(
     "YOUTUBE_USE_COOKIES",
-    "true"
+    "false"
 ).strip().lower() in ("1", "true", "yes", "on")
+
+COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
 
@@ -654,13 +645,6 @@ async def lifespan(app: FastAPI):
                 f"from COOKIE_URL: {e}"
             )
 
-    logger.info(
-        "YouTube config: clients=%s cookies_enabled=%s cookies_file=%s",
-        YOUTUBE_PLAYER_CLIENT_LIST,
-        YOUTUBE_USE_COOKIES,
-        os.path.isfile(COOKIES_FILE),
-    )
-
     # -----------------------------------------
     # Start cleanup worker
     # -----------------------------------------
@@ -974,14 +958,14 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Use the documented yt-dlp Python extractor_args mapping.
-    # Cookie-enabled attempts are made first when explicitly enabled.
-    # The configured clients are then tried without cookies as fallbacks.
-    client_names = YOUTUBE_PLAYER_CLIENT_LIST
+    # Try several current YouTube clients.  The previous code accidentally
+    # supplied extractor_args in the wrong shape (a list instead of the
+    # documented player_client mapping), which could make the fast resolver
+    # fail and unnecessarily send the bot to cookies.
+    client_names = ["default", "android", "web", "web_embedded"]
     attempts = []
     if use_cookies:
-        for name in client_names:
-            attempts.append((f"{name}-cookies", name, True))
+        attempts.append(("default-cookies", "default", True))
     for name in client_names:
         attempts.append((name, name, False))
 
@@ -998,7 +982,7 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
-        opts["js_runtimes"] = {"node": {}}
+            opts["js_runtimes"] = {"node": {}}
 
         attempt_started = time.perf_counter()
         try:
@@ -1238,9 +1222,10 @@ def download_audio_sync(
         ],
 
         "extractor_args": {
-            "youtube": {
-                "player_client": YOUTUBE_PLAYER_CLIENT_LIST
-            }
+
+            "youtube": [
+                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+            ]
         },
 
         # -----------------------------------------
@@ -1583,9 +1568,10 @@ def download_video_sync(
             False,
 
         "extractor_args": {
-            "youtube": {
-                "player_client": YOUTUBE_PLAYER_CLIENT_LIST
-            }
+
+            "youtube": [
+                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+            ]
         },
 
         # -----------------------------------------
@@ -2128,6 +2114,25 @@ async def _proxy_direct_audio(url: str) -> StreamingResponse:
     content_type = upstream.headers.get("content-type", "audio/mpeg").split(";", 1)[0]
     return StreamingResponse(body(), media_type=content_type, headers=response_headers)
 
+
+@app.get("/stream")
+async def stream_audio(
+    _: bool = Depends(require_api_key),
+    url: str = Query(..., description="YouTube URL or video ID"),
+):
+    """Resolve and proxy audio so clients never fetch the signed URL directly."""
+    try:
+        return await _proxy_direct_audio(url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Audio proxy error: %s", e)
+        raise HTTPException(status_code=502, detail={"error": "Audio proxy failed", "message": str(e)})
+
+
+# =========================================================
+# AUDIO DOWNLOAD API
+# =========================================================
 
 @app.get("/download")
 async def download_audio(

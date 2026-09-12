@@ -110,20 +110,12 @@ If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an
 
 ## FAST AUDIO MODE
 For the fastest `/stream` and `/download?type=audio` paths, set:
-- `YOUTUBE_USE_COOKIES=true` when YouTube returns `Sign in to confirm you're not a bot` and
-  `COOKIE_URL` points to a fresh, private Netscape/Mozilla `cookies.txt`.
-- `COOKIE_URL=<your privately hosted cookies.txt URL>`; do not commit cookies to Git.
-- `YOUTUBE_PLAYER_CLIENTS=default,web_embedded`
-
-The API now passes `extractor_args` using yt-dlp's Python mapping form and tries the
-configured clients with cookies first, then without cookies. If the cookie session is
-invalid/rotated, refresh the cookie file rather than repeatedly retrying it.
+- `YOUTUBE_USE_COOKIES=false` for normal public music. Enable it only when
+  you intentionally provide a valid private cookies file and YouTube requires
+  it; stale cookies can make first-attempt extraction unreliable.
+- `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
+- `YOUTUBE_PLAYER_CLIENTS=default`
 
 The API resolves the signed YouTube media URL and proxies the audio bytes
 through the API server. This avoids HTTP 403 responses caused by a bot worker
 fetching a URL signed for a different server IP.
-
-## YouTube cookies
-
-If you deploy with a bundled `cookies.txt`, set `YOUTUBE_USE_COOKIES=true` and `COOKIE_FILE=cookies.txt`. The application will use the bundled file automatically. `COOKIE_URL` is optional and, when set, refreshes the cookie file at startup. Treat `cookies.txt` as a secret: do not publish it in a public repository or share it.
-
