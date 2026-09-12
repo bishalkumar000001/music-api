@@ -63,6 +63,9 @@ YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "YOUTUBE_PLAYER_CLIENTS",
     "default,web_embedded"
 ).strip()
+YOUTUBE_PLAYER_CLIENT_LIST = [
+    c.strip() for c in YOUTUBE_PLAYER_CLIENTS.split(",") if c.strip()
+] or ["default"]
 
 # YouTube can currently downgrade logged-in cookie sessions to the
 # tv_downgraded client, which may return "The page needs to be reloaded".
@@ -645,6 +648,13 @@ async def lifespan(app: FastAPI):
                 f"from COOKIE_URL: {e}"
             )
 
+    logger.info(
+        "YouTube config: clients=%s cookies_enabled=%s cookies_file=%s",
+        YOUTUBE_PLAYER_CLIENT_LIST,
+        YOUTUBE_USE_COOKIES,
+        os.path.isfile(COOKIES_FILE),
+    )
+
     # -----------------------------------------
     # Start cleanup worker
     # -----------------------------------------
@@ -958,14 +968,14 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Try several current YouTube clients.  The previous code accidentally
-    # supplied extractor_args in the wrong shape (a list instead of the
-    # documented player_client mapping), which could make the fast resolver
-    # fail and unnecessarily send the bot to cookies.
-    client_names = ["default", "android", "web", "web_embedded"]
+    # Use the documented yt-dlp Python extractor_args mapping.
+    # Cookie-enabled attempts are made first when explicitly enabled.
+    # The configured clients are then tried without cookies as fallbacks.
+    client_names = YOUTUBE_PLAYER_CLIENT_LIST
     attempts = []
     if use_cookies:
-        attempts.append(("default-cookies", "default", True))
+        for name in client_names:
+            attempts.append((f"{name}-cookies", name, True))
     for name in client_names:
         attempts.append((name, name, False))
 
@@ -982,7 +992,7 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
-            opts["js_runtimes"] = {"node": {}}
+        opts["js_runtimes"] = {"node": {}}
 
         attempt_started = time.perf_counter()
         try:
@@ -1222,10 +1232,9 @@ def download_audio_sync(
         ],
 
         "extractor_args": {
-
-            "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
-            ]
+            "youtube": {
+                "player_client": YOUTUBE_PLAYER_CLIENT_LIST
+            }
         },
 
         # -----------------------------------------
@@ -1568,10 +1577,9 @@ def download_video_sync(
             False,
 
         "extractor_args": {
-
-            "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
-            ]
+            "youtube": {
+                "player_client": YOUTUBE_PLAYER_CLIENT_LIST
+            }
         },
 
         # -----------------------------------------
