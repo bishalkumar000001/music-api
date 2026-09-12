@@ -55,24 +55,37 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv("COOKIE_URL", "")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# YouTube player clients. Avoid the deprecated/problematic tv_downgraded
-# client that can cause "The page needs to be reloaded" errors.
-YOUTUBE_PLAYER_CLIENTS = os.getenv(
-    "YOUTUBE_PLAYER_CLIENTS",
-    "default,web_embedded"
-).strip()
+COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
 
-# YouTube can currently downgrade logged-in cookie sessions to the
-# tv_downgraded client, which may return "The page needs to be reloaded".
-# Public music/video downloads normally do not need account cookies.
+# YouTube player clients. Keep this configurable, but parse it into a real
+# list before passing it to yt-dlp. Do not use the deprecated tv_downgraded
+# client.
+YOUTUBE_PLAYER_CLIENTS = [
+    client.strip()
+    for client in os.getenv(
+        "YOUTUBE_PLAYER_CLIENTS",
+        "default,web_embedded"
+    ).split(",")
+    if client.strip() and client.strip() != "tv_downgraded"
+]
+
+# Cookies are enabled by default when a bundled cookies.txt exists. This is
+# important on Heroku because YouTube can challenge datacenter IPs with
+# "Sign in to confirm you're not a bot".
 YOUTUBE_USE_COOKIES = os.getenv(
     "YOUTUBE_USE_COOKIES",
-    "false"
+    "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-COOKIES_FILE = "cookies.txt"
+# Allow an absolute path or a path relative to the application directory.
+_cookie_file_env = os.getenv("COOKIE_FILE", "cookies.txt").strip()
+COOKIES_FILE = (
+    _cookie_file_env
+    if os.path.isabs(_cookie_file_env)
+    else os.path.join(BASE_DIR, _cookie_file_env)
+)
 
 DB_FILE = "cache.db"
 
@@ -177,6 +190,14 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+logger.info(
+    "YouTube config: clients=%s cookies_enabled=%s cookies_file=%s exists=%s",
+    YOUTUBE_PLAYER_CLIENTS,
+    YOUTUBE_USE_COOKIES,
+    COOKIES_FILE,
+    os.path.isfile(COOKIES_FILE),
+)
 
 
 # =========================================================
@@ -627,6 +648,7 @@ async def lifespan(app: FastAPI):
     if COOKIE_URL:
 
         try:
+            os.makedirs(os.path.dirname(COOKIES_FILE) or ".", exist_ok=True)
 
             urllib.request.urlretrieve(
                 COOKIE_URL,
@@ -634,8 +656,8 @@ async def lifespan(app: FastAPI):
             )
 
             logger.info(
-                "Successfully downloaded "
-                "cookies.txt from COOKIE_URL"
+                "Successfully downloaded YouTube cookies to %s",
+                COOKIES_FILE,
             )
 
         except Exception as e:
@@ -644,6 +666,16 @@ async def lifespan(app: FastAPI):
                 f"Failed to download cookies "
                 f"from COOKIE_URL: {e}"
             )
+    elif os.path.isfile(COOKIES_FILE):
+        logger.info(
+            "Using bundled YouTube cookies: %s",
+            COOKIES_FILE,
+        )
+    elif YOUTUBE_USE_COOKIES:
+        logger.warning(
+            "YOUTUBE_USE_COOKIES=true but cookies file was not found: %s",
+            COOKIES_FILE,
+        )
 
     # -----------------------------------------
     # Start cleanup worker
@@ -862,6 +894,12 @@ def get_base_ydl_opts() -> Dict[str, Any]:
                 "node": {}
             },
 
+        "extractor_args": {
+            "youtube": {
+                "player_client": YOUTUBE_PLAYER_CLIENTS
+            }
+        },
+
         # yt-dlp-ejs is installed locally; avoid a GitHub fetch on every download.
     }
 
@@ -958,14 +996,16 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Try several current YouTube clients.  The previous code accidentally
-    # supplied extractor_args in the wrong shape (a list instead of the
-    # documented player_client mapping), which could make the fast resolver
-    # fail and unnecessarily send the bot to cookies.
-    client_names = ["default", "android", "web", "web_embedded"]
+    # Try configured clients with cookies first, then public extraction as a
+    # fallback. This makes the bundled authenticated session actually useful
+    # against YouTube's datacenter anti-bot challenge.
+    client_names = YOUTUBE_PLAYER_CLIENTS or ["default", "web_embedded"]
     attempts = []
+
     if use_cookies:
-        attempts.append(("default-cookies", "default", True))
+        for name in client_names:
+            attempts.append((f"{name}-cookies", name, True))
+
     for name in client_names:
         attempts.append((name, name, False))
 
@@ -980,9 +1020,11 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
 
         opts = dict(common)
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        # yt-dlp's YouTube extractor may require JavaScript solving even for
+        # public extraction, so keep the Node runtime enabled for every attempt.
+        opts["js_runtimes"] = {"node": {}}
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
-            opts["js_runtimes"] = {"node": {}}
 
         attempt_started = time.perf_counter()
         try:
@@ -1222,10 +1264,9 @@ def download_audio_sync(
         ],
 
         "extractor_args": {
-
-            "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
-            ]
+            "youtube": {
+                "player_client": YOUTUBE_PLAYER_CLIENTS
+            }
         },
 
         # -----------------------------------------
@@ -1568,10 +1609,9 @@ def download_video_sync(
             False,
 
         "extractor_args": {
-
-            "youtube": [
-                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
-            ]
+            "youtube": {
+                "player_client": YOUTUBE_PLAYER_CLIENTS
+            }
         },
 
         # -----------------------------------------
