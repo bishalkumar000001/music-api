@@ -55,7 +55,15 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv("COOKIE_URL", "")
+COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
+
+# Keep the cookie file configurable. On Heroku, a bundled cookies.txt is
+# available in the slug when supplied with the deployment package.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIES_FILE = os.getenv(
+    "COOKIE_FILE",
+    os.path.join(BASE_DIR, "cookies.txt")
+).strip()
 
 # YouTube player clients. Avoid the deprecated/problematic tv_downgraded
 # client that can cause "The page needs to be reloaded" errors.
@@ -72,10 +80,8 @@ YOUTUBE_PLAYER_CLIENT_LIST = [
 # Public music/video downloads normally do not need account cookies.
 YOUTUBE_USE_COOKIES = os.getenv(
     "YOUTUBE_USE_COOKIES",
-    "false"
+    "true"
 ).strip().lower() in ("1", "true", "yes", "on")
-
-COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
 

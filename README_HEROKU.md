@@ -122,3 +122,8 @@ invalid/rotated, refresh the cookie file rather than repeatedly retrying it.
 The API resolves the signed YouTube media URL and proxies the audio bytes
 through the API server. This avoids HTTP 403 responses caused by a bot worker
 fetching a URL signed for a different server IP.
+
+## YouTube cookies
+
+If you deploy with a bundled `cookies.txt`, set `YOUTUBE_USE_COOKIES=true` and `COOKIE_FILE=cookies.txt`. The application will use the bundled file automatically. `COOKIE_URL` is optional and, when set, refreshes the cookie file at startup. Treat `cookies.txt` as a secret: do not publish it in a public repository or share it.
+
