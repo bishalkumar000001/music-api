@@ -938,9 +938,10 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 3,
-        "retries": 0,
-        "fragment_retries": 0,
+        "socket_timeout": max(SOCKET_TIMEOUT, 8),
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 2,
         "check_formats": False,
         "format": "bestaudio/best",
         "http_headers": {
@@ -949,16 +950,33 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Try one fast path first. Only fall back when the first client actually fails.
-    attempts = [("default", True)] if use_cookies else [("android", False), ("web", False)]
+    # Try several current YouTube clients.  The previous code accidentally
+    # supplied extractor_args in the wrong shape (a list instead of the
+    # documented player_client mapping), which could make the fast resolver
+    # fail and unnecessarily send the bot to cookies.
+    client_names = ["default", "android", "web", "web_embedded"]
+    attempts = []
+    if use_cookies:
+        attempts.append(("default-cookies", "default", True))
+    for name in client_names:
+        attempts.append((name, name, False))
+
     last_error = None
-    for name, with_cookies in attempts:
+    for name, client, with_cookies in attempts:
+        # Do not make repeated extraction calls when another request has just
+        # populated the cache.
+        cached = _get_direct_cached(video_id)
+        if cached:
+            return {"status": True, "videoId": video_id, "url": cached,
+                    "cached": True, "resolve_time": 0}
+
         opts = dict(common)
-        opts["extractor_args"] = {"youtube": [f"player_client={name}"]}
+        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
             opts["js_runtimes"] = {"node": {}}
 
+        attempt_started = time.perf_counter()
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(canonical, download=False)
@@ -979,7 +997,10 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
 
             elapsed = round(time.perf_counter() - started, 3)
             _set_direct_cached(video_id, media_url)
-            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s", elapsed, video_id, name, with_cookies)
+            logger.info(
+                "FAST audio resolved in %ss for %s using %s cookies=%s",
+                elapsed, video_id, name, with_cookies,
+            )
             return {
                 "status": True,
                 "videoId": video_id,
@@ -992,7 +1013,10 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             last_error = exc
-            logger.warning("FAST resolver %s failed after %ss: %s", name, round(time.perf_counter() - started, 3), exc)
+            logger.warning(
+                "FAST resolver %s failed after %ss: %s",
+                name, round(time.perf_counter() - attempt_started, 3), exc,
+            )
 
     raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
@@ -2007,6 +2031,57 @@ async def _proxy_direct_audio(url: str) -> StreamingResponse:
         status = upstream.status_code
         await upstream.aclose()
         await client.aclose()
+
+        # Signed YouTube URLs can expire before our short cache TTL.  Evict the
+        # stale entry and resolve once more instead of making the bot fall back
+        # to its own yt-dlp/cookie downloader.
+        video_id = extract_video_id(url)
+        if video_id:
+            with DIRECT_CACHE_LOCK:
+                DIRECT_URL_CACHE.pop(video_id, None)
+            try:
+                retry_result = await asyncio.to_thread(resolve_direct_audio_sync, video_id)
+                retry_url = retry_result.get("url") if isinstance(retry_result, dict) else None
+                if retry_url:
+                    retry_client = httpx.AsyncClient(
+                        follow_redirects=True,
+                        timeout=httpx.Timeout(60.0, connect=10.0),
+                    )
+                    retry_upstream = await retry_client.send(
+                        retry_client.build_request(
+                            "GET",
+                            retry_url,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+                                "Accept-Language": "en-US,en;q=0.8",
+                            },
+                        ),
+                        stream=True,
+                    )
+                    if retry_upstream.status_code == 200:
+                        async def retry_body():
+                            try:
+                                async for chunk in retry_upstream.aiter_bytes(64 * 1024):
+                                    if chunk:
+                                        yield chunk
+                            finally:
+                                await retry_upstream.aclose()
+                                await retry_client.aclose()
+
+                        retry_headers = {
+                            "Cache-Control": "no-store",
+                            "X-API-Resolve-Time": str(retry_result.get("resolve_time", "retry")),
+                        }
+                        if retry_upstream.headers.get("content-length"):
+                            retry_headers["Content-Length"] = retry_upstream.headers["content-length"]
+                        retry_type = retry_upstream.headers.get("content-type", "audio/mpeg").split(";", 1)[0]
+                        logger.info("Recovered stale signed URL for %s after upstream HTTP %s", video_id, status)
+                        return StreamingResponse(retry_body(), media_type=retry_type, headers=retry_headers)
+                    await retry_upstream.aclose()
+                    await retry_client.aclose()
+            except Exception as retry_exc:
+                logger.warning("Signed URL refresh failed for %s: %s", video_id, retry_exc)
+
         raise HTTPException(
             status_code=502,
             detail=f"YouTube audio upstream returned HTTP {status}",
