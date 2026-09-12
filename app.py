@@ -676,6 +676,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Keep a visible startup diagnostic so Heroku logs immediately show which
+# audio endpoints are actually loaded by the running process.
+@app.on_event("startup")
+async def _log_audio_routes():
+    routes = {getattr(route, "path", "") for route in app.routes}
+    logger.info("🎵 Audio routes loaded: /stream=%s /download=%s",
+                "/stream" in routes, "/download" in routes)
+
 
 # =========================================================
 # CORS
