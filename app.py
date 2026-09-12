@@ -9,7 +9,6 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
@@ -55,37 +54,24 @@ PORT = int(
     )
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIE_URL = os.getenv("COOKIE_URL", "")
 
-COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
+# YouTube player clients. Avoid the deprecated/problematic tv_downgraded
+# client that can cause "The page needs to be reloaded" errors.
+YOUTUBE_PLAYER_CLIENTS = os.getenv(
+    "YOUTUBE_PLAYER_CLIENTS",
+    "default,web_embedded"
+).strip()
 
-# YouTube player clients. Keep this configurable, but parse it into a real
-# list before passing it to yt-dlp. Do not use the deprecated tv_downgraded
-# client.
-YOUTUBE_PLAYER_CLIENTS = [
-    client.strip()
-    for client in os.getenv(
-        "YOUTUBE_PLAYER_CLIENTS",
-        "default,web_embedded"
-    ).split(",")
-    if client.strip() and client.strip() != "tv_downgraded"
-]
-
-# Cookies are enabled by default when a bundled cookies.txt exists. This is
-# important on Heroku because YouTube can challenge datacenter IPs with
-# "Sign in to confirm you're not a bot".
+# YouTube can currently downgrade logged-in cookie sessions to the
+# tv_downgraded client, which may return "The page needs to be reloaded".
+# Public music/video downloads normally do not need account cookies.
 YOUTUBE_USE_COOKIES = os.getenv(
     "YOUTUBE_USE_COOKIES",
     "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Allow an absolute path or a path relative to the application directory.
-_cookie_file_env = os.getenv("COOKIE_FILE", "cookies.txt").strip()
-COOKIES_FILE = (
-    _cookie_file_env
-    if os.path.isabs(_cookie_file_env)
-    else os.path.join(BASE_DIR, _cookie_file_env)
-)
+COOKIES_FILE = "cookies.txt"
 
 DB_FILE = "cache.db"
 
@@ -190,14 +176,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-logger.info(
-    "YouTube config: clients=%s cookies_enabled=%s cookies_file=%s exists=%s",
-    YOUTUBE_PLAYER_CLIENTS,
-    YOUTUBE_USE_COOKIES,
-    COOKIES_FILE,
-    os.path.isfile(COOKIES_FILE),
-)
 
 
 # =========================================================
@@ -648,7 +626,6 @@ async def lifespan(app: FastAPI):
     if COOKIE_URL:
 
         try:
-            os.makedirs(os.path.dirname(COOKIES_FILE) or ".", exist_ok=True)
 
             urllib.request.urlretrieve(
                 COOKIE_URL,
@@ -656,8 +633,8 @@ async def lifespan(app: FastAPI):
             )
 
             logger.info(
-                "Successfully downloaded YouTube cookies to %s",
-                COOKIES_FILE,
+                "Successfully downloaded "
+                "cookies.txt from COOKIE_URL"
             )
 
         except Exception as e:
@@ -666,16 +643,6 @@ async def lifespan(app: FastAPI):
                 f"Failed to download cookies "
                 f"from COOKIE_URL: {e}"
             )
-    elif os.path.isfile(COOKIES_FILE):
-        logger.info(
-            "Using bundled YouTube cookies: %s",
-            COOKIES_FILE,
-        )
-    elif YOUTUBE_USE_COOKIES:
-        logger.warning(
-            "YOUTUBE_USE_COOKIES=true but cookies file was not found: %s",
-            COOKIES_FILE,
-        )
 
     # -----------------------------------------
     # Start cleanup worker
@@ -707,14 +674,6 @@ app = FastAPI(
     version="3.0.0-UltraFast",
     lifespan=lifespan
 )
-
-# Keep a visible startup diagnostic so Heroku logs immediately show which
-# audio endpoints are actually loaded by the running process.
-@app.on_event("startup")
-async def _log_audio_routes():
-    routes = {getattr(route, "path", "") for route in app.routes}
-    logger.info("🎵 Audio routes loaded: /stream=%s /download=%s",
-                "/stream" in routes, "/download" in routes)
 
 
 # =========================================================
@@ -894,12 +853,6 @@ def get_base_ydl_opts() -> Dict[str, Any]:
                 "node": {}
             },
 
-        "extractor_args": {
-            "youtube": {
-                "player_client": YOUTUBE_PLAYER_CLIENTS
-            }
-        },
-
         # yt-dlp-ejs is installed locally; avoid a GitHub fetch on every download.
     }
 
@@ -984,10 +937,9 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": max(SOCKET_TIMEOUT, 8),
-        "retries": 1,
-        "fragment_retries": 1,
-        "extractor_retries": 2,
+        "socket_timeout": 3,
+        "retries": 0,
+        "fragment_retries": 0,
         "check_formats": False,
         "format": "bestaudio/best",
         "http_headers": {
@@ -996,37 +948,16 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
         },
     }
 
-    # Try configured clients with cookies first, then public extraction as a
-    # fallback. This makes the bundled authenticated session actually useful
-    # against YouTube's datacenter anti-bot challenge.
-    client_names = YOUTUBE_PLAYER_CLIENTS or ["default", "web_embedded"]
-    attempts = []
-
-    if use_cookies:
-        for name in client_names:
-            attempts.append((f"{name}-cookies", name, True))
-
-    for name in client_names:
-        attempts.append((name, name, False))
-
+    # Try one fast path first. Only fall back when the first client actually fails.
+    attempts = [("default", True)] if use_cookies else [("android", False), ("web", False)]
     last_error = None
-    for name, client, with_cookies in attempts:
-        # Do not make repeated extraction calls when another request has just
-        # populated the cache.
-        cached = _get_direct_cached(video_id)
-        if cached:
-            return {"status": True, "videoId": video_id, "url": cached,
-                    "cached": True, "resolve_time": 0}
-
+    for name, with_cookies in attempts:
         opts = dict(common)
-        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-        # yt-dlp's YouTube extractor may require JavaScript solving even for
-        # public extraction, so keep the Node runtime enabled for every attempt.
-        opts["js_runtimes"] = {"node": {}}
+        opts["extractor_args"] = {"youtube": [f"player_client={name}"]}
         if with_cookies:
             opts["cookiefile"] = COOKIES_FILE
+            opts["js_runtimes"] = {"node": {}}
 
-        attempt_started = time.perf_counter()
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(canonical, download=False)
@@ -1047,10 +978,7 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
 
             elapsed = round(time.perf_counter() - started, 3)
             _set_direct_cached(video_id, media_url)
-            logger.info(
-                "FAST audio resolved in %ss for %s using %s cookies=%s",
-                elapsed, video_id, name, with_cookies,
-            )
+            logger.info("FAST audio resolved in %ss for %s using %s cookies=%s", elapsed, video_id, name, with_cookies)
             return {
                 "status": True,
                 "videoId": video_id,
@@ -1063,10 +991,7 @@ def _resolve_direct_audio_uncached(video_id: str) -> Dict[str, Any]:
             }
         except Exception as exc:
             last_error = exc
-            logger.warning(
-                "FAST resolver %s failed after %ss: %s",
-                name, round(time.perf_counter() - attempt_started, 3), exc,
-            )
+            logger.warning("FAST resolver %s failed after %ss: %s", name, round(time.perf_counter() - started, 3), exc)
 
     raise RuntimeError(str(last_error) if last_error else "Unable to resolve YouTube audio")
 
@@ -1264,9 +1189,10 @@ def download_audio_sync(
         ],
 
         "extractor_args": {
-            "youtube": {
-                "player_client": YOUTUBE_PLAYER_CLIENTS
-            }
+
+            "youtube": [
+                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+            ]
         },
 
         # -----------------------------------------
@@ -1609,9 +1535,10 @@ def download_video_sync(
             False,
 
         "extractor_args": {
-            "youtube": {
-                "player_client": YOUTUBE_PLAYER_CLIENTS
-            }
+
+            "youtube": [
+                f"player_client={YOUTUBE_PLAYER_CLIENTS}"
+            ]
         },
 
         # -----------------------------------------
@@ -2047,129 +1974,6 @@ async def direct_audio(
         raise HTTPException(status_code=500, detail={"error": "Direct audio failed", "message": str(e)})
 
 
-async def _proxy_direct_audio(url: str) -> StreamingResponse:
-    """Resolve and proxy audio through this API server.
-
-    YouTube signed media URLs can be rejected when the client fetching them
-    has a different egress IP from the server that resolved them. Keeping the
-    upstream connection on this dyno avoids that cross-host 403.
-    """
-    result = await asyncio.to_thread(resolve_direct_audio_sync, url)
-    audio_url = result.get("url") if isinstance(result, dict) else None
-    if not isinstance(audio_url, str) or not audio_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=502, detail="YouTube did not return a usable audio URL")
-
-    client = httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(60.0, connect=10.0),
-    )
-    upstream = await client.send(
-        client.build_request(
-            "GET",
-            audio_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.8",
-            },
-        ),
-        stream=True,
-    )
-
-    if upstream.status_code != 200:
-        status = upstream.status_code
-        await upstream.aclose()
-        await client.aclose()
-
-        # Signed YouTube URLs can expire before our short cache TTL.  Evict the
-        # stale entry and resolve once more instead of making the bot fall back
-        # to its own yt-dlp/cookie downloader.
-        video_id = extract_video_id(url)
-        if video_id:
-            with DIRECT_CACHE_LOCK:
-                DIRECT_URL_CACHE.pop(video_id, None)
-            try:
-                retry_result = await asyncio.to_thread(resolve_direct_audio_sync, video_id)
-                retry_url = retry_result.get("url") if isinstance(retry_result, dict) else None
-                if retry_url:
-                    retry_client = httpx.AsyncClient(
-                        follow_redirects=True,
-                        timeout=httpx.Timeout(60.0, connect=10.0),
-                    )
-                    retry_upstream = await retry_client.send(
-                        retry_client.build_request(
-                            "GET",
-                            retry_url,
-                            headers={
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-                                "Accept-Language": "en-US,en;q=0.8",
-                            },
-                        ),
-                        stream=True,
-                    )
-                    if retry_upstream.status_code == 200:
-                        async def retry_body():
-                            try:
-                                async for chunk in retry_upstream.aiter_bytes(64 * 1024):
-                                    if chunk:
-                                        yield chunk
-                            finally:
-                                await retry_upstream.aclose()
-                                await retry_client.aclose()
-
-                        retry_headers = {
-                            "Cache-Control": "no-store",
-                            "X-API-Resolve-Time": str(retry_result.get("resolve_time", "retry")),
-                        }
-                        if retry_upstream.headers.get("content-length"):
-                            retry_headers["Content-Length"] = retry_upstream.headers["content-length"]
-                        retry_type = retry_upstream.headers.get("content-type", "audio/mpeg").split(";", 1)[0]
-                        logger.info("Recovered stale signed URL for %s after upstream HTTP %s", video_id, status)
-                        return StreamingResponse(retry_body(), media_type=retry_type, headers=retry_headers)
-                    await retry_upstream.aclose()
-                    await retry_client.aclose()
-            except Exception as retry_exc:
-                logger.warning("Signed URL refresh failed for %s: %s", video_id, retry_exc)
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"YouTube audio upstream returned HTTP {status}",
-        )
-
-    async def body():
-        try:
-            async for chunk in upstream.aiter_bytes(64 * 1024):
-                if chunk:
-                    yield chunk
-        finally:
-            await upstream.aclose()
-            await client.aclose()
-
-    response_headers = {
-        "Cache-Control": "no-store",
-        "X-API-Resolve-Time": str(result.get("resolve_time", "cached")),
-    }
-    if upstream.headers.get("content-length"):
-        response_headers["Content-Length"] = upstream.headers["content-length"]
-
-    content_type = upstream.headers.get("content-type", "audio/mpeg").split(";", 1)[0]
-    return StreamingResponse(body(), media_type=content_type, headers=response_headers)
-
-
-@app.get("/stream")
-async def stream_audio(
-    _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID"),
-):
-    """Resolve and proxy audio so clients never fetch the signed URL directly."""
-    try:
-        return await _proxy_direct_audio(url)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Audio proxy error: %s", e)
-        raise HTTPException(status_code=502, detail={"error": "Audio proxy failed", "message": str(e)})
-
-
 # =========================================================
 # AUDIO DOWNLOAD API
 # =========================================================
@@ -2199,10 +2003,20 @@ async def download_audio(
                 detail="type must be audio or video"
             )
 
-        # Proxy audio through the API server. Returning a YouTube signed URL
-        # directly can produce HTTP 403 when the bot uses a different egress IP.
+        # FAST AUDIO PATH: never download/convert the complete song on Heroku.
+        # Resolve YouTube's signed audio URL and redirect the client directly to it.
+        # HTTP clients normally follow the redirect automatically, so playback/download
+        # starts immediately instead of waiting for a full MP3 conversion.
         if requested_type == "audio":
-            return await _proxy_direct_audio(url)
+            result = await asyncio.to_thread(resolve_direct_audio_sync, url)
+            return RedirectResponse(
+                url=result["url"],
+                status_code=302,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-API-Resolve-Time": str(result.get("resolve_time", "cached")),
+                },
+            )
 
         # The legacy bot uses /download?type=video. Keep that contract
         # working without changing the modern JSON response by default.
@@ -2234,8 +2048,6 @@ async def download_audio(
             content=result
         )
 
-    except HTTPException:
-        raise
     except Exception as e:
 
         logger.error(

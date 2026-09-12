@@ -100,7 +100,6 @@ Authorization: Bearer YOUR_GENERATED_KEY
 
 - `GET /search`
 - `GET /thumbnail`
-- `GET /stream`
 - `GET /download`
 - `GET /video`
 - `GET /files/{filename}`
@@ -109,13 +108,9 @@ Without a valid key these return HTTP `401`.
 If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
 
 ## FAST AUDIO MODE
-For the fastest `/stream` and `/download?type=audio` paths, set:
-- `YOUTUBE_USE_COOKIES=false` for normal public music. Enable it only when
-  you intentionally provide a valid private cookies file and YouTube requires
-  it; stale cookies can make first-attempt extraction unreliable.
+For the fastest `/download?type=audio` path, set:
+- `YOUTUBE_USE_COOKIES=true`
 - `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
 - `YOUTUBE_PLAYER_CLIENTS=default`
 
-The API resolves the signed YouTube media URL and proxies the audio bytes
-through the API server. This avoids HTTP 403 responses caused by a bot worker
-fetching a URL signed for a different server IP.
+The audio endpoint resolves a signed YouTube media URL and returns a 302 redirect; it does not wait for a complete MP3 download or FFmpeg conversion.
