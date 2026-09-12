@@ -1,0 +1,16 @@
+fastapi>=0.117.1
+uvicorn>=0.35.0
+httpx>=0.28.1
+yt-dlp[default]>=2026.08.19
+yt-dlp-ejs
+ytmusicapi
+python-dotenv
+aiofiles
+psutil
+orjson
+watchdog
+prometheus-client
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+redis
