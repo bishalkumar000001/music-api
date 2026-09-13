@@ -2,24 +2,67 @@
   "name": "Magma Music API",
   "description": "FastAPI YouTube/YouTube Music API prepared for Heroku",
   "buildpacks": [
-    {"url": "heroku/python"},
-    {"url": "heroku/nodejs"},
-    {"url": "https://github.com/heroku/heroku-buildpack-apt"}
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "heroku/nodejs"
+    },
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    }
   ],
   "env": {
-    "COOKIE_URL": {
-      "description": "Public URL of the yt-dlp cookies.txt file",
-      "required": false,
-      "value": "https://raw.githubusercontent.com/themagmalord333-oss/COOKIE/main/cookies.txt"
+    "REQUIRE_API_KEY": {
+      "description": "Require API keys on API routes (false keeps Telegram-bot compatibility)",
+      "value": "false"
     },
-    "DOWNLOAD_DIR": {"value": "downloads"},
-    "CACHE_EXPIRE_HOURS": {"value": "24"},
-    "MAX_VIDEO_QUALITY": {"value": "720"},
-    "DOWNLOAD_WORKERS": {"value": "4"},
-    "CONCURRENT_FRAGMENT_DOWNLOADS": {"value": "15"},
-    "HTTP_CHUNK_SIZE": {"value": "10485760"},
-    "SOCKET_TIMEOUT": {"value": "15"},
-    "RETRIES": {"value": "5"},
-    "FRAGMENT_RETRIES": {"value": "5"}
+    "API_KEY": {
+      "description": "Optional API key; only enforced when REQUIRE_API_KEY=true",
+      "required": false
+    },
+    "YOUTUBE_USE_COOKIES": {
+      "description": "Enable yt-dlp cookie authentication",
+      "value": "true"
+    },
+    "YOUTUBE_COOKIES_B64": {
+      "description": "Base64-encoded Netscape cookies.txt content",
+      "required": false
+    },
+    "COOKIE_URL": {
+      "description": "Private URL for a Netscape cookies.txt file",
+      "required": false
+    },
+    "COOKIE_URLS": {
+      "description": "Comma/newline-separated private cookie URLs; first reachable URL is used",
+      "required": false
+    },
+    "DOWNLOAD_DIR": {
+      "value": "downloads"
+    },
+    "CACHE_EXPIRE_HOURS": {
+      "value": "24"
+    },
+    "MAX_VIDEO_QUALITY": {
+      "value": "720"
+    },
+    "DOWNLOAD_WORKERS": {
+      "value": "4"
+    },
+    "CONCURRENT_FRAGMENT_DOWNLOADS": {
+      "value": "15"
+    },
+    "HTTP_CHUNK_SIZE": {
+      "value": "10485760"
+    },
+    "SOCKET_TIMEOUT": {
+      "value": "15"
+    },
+    "RETRIES": {
+      "value": "5"
+    },
+    "FRAGMENT_RETRIES": {
+      "value": "5"
+    }
   }
 }
