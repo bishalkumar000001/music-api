@@ -1,116 +1,61 @@
 # Heroku Deployment
 
-This version is prepared for Heroku. It does not run `install.sh` during startup, does not create a Python virtualenv, and uses Heroku's `$PORT`.
+This FastAPI service is designed for Telegram music bots and supports both the original routes and compatibility aliases.
 
-## Required buildpacks
-
-Add these buildpacks to the Heroku app:
+## Deploy
 
 ```bash
 heroku buildpacks:clear
 heroku buildpacks:add --index 1 https://github.com/heroku/heroku-buildpack-activestorage-preview
 heroku buildpacks:add heroku/python
 heroku buildpacks:add heroku/nodejs
-```
-
-The Active Storage Preview buildpack provides FFmpeg and FFprobe. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime. The `Aptfile` is not required for FFmpeg.
-
-## Config Vars
-
-```text
-COOKIE_URL=https://raw.githubusercontent.com/themagmalord333-oss/COOKIE/main/cookies.txt
-DOWNLOAD_DIR=downloads
-CACHE_EXPIRE_HOURS=24
-MAX_VIDEO_QUALITY=720
-DOWNLOAD_WORKERS=4
-CONCURRENT_FRAGMENT_DOWNLOADS=15
-HTTP_CHUNK_SIZE=10485760
-SOCKET_TIMEOUT=15
-RETRIES=5
-FRAGMENT_RETRIES=5
-```
-
-Do **not** set `PORT`; Heroku supplies it automatically.
-
-## Deploy
-
-```bash
-git add .
-git commit -m "Prepare API for Heroku"
 git push heroku main
 ```
 
-If deploying from GitHub, connect the repository and deploy the branch normally after adding the buildpacks and Config Vars.
+The Active Storage Preview buildpack provides FFmpeg/FFprobe. Node.js is used by yt-dlp's JavaScript runtime.
+
+## Required Config Vars
+
+```text
+YOUTUBE_USE_COOKIES=true
+YOUTUBE_COOKIES_B64=<base64 of your private Netscape cookies.txt>
+REQUIRE_API_KEY=false
+```
+
+`YOUTUBE_COOKIES_B64` is preferred because it works safely as a single Heroku Config Var. Generate it locally with:
+
+```bash
+base64 -w 0 cookies.txt
+```
+
+PowerShell:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+```
+
+Alternative: set `COOKIE_URL` or `COOKIE_URLS` to a private cookie-file URL. Do not use a public GitHub/raw URL for cookies, and never commit `cookies.txt`.
+
+Heroku supplies `PORT` automatically. The filesystem is ephemeral, so `downloads/` and `cache.db` are temporary.
+
+## Telegram bot compatibility
+
+All of these route families are available:
+
+- `/search`, `/api/search`, `/api/v1/search`
+- `/download`, `/api/download`, `/api/v1/download`
+- `/video`, `/api/video`, `/api/v1/video`
+- `/thumbnail`, `/api/thumbnail`, `/api/v1/thumbnail`
+- `/direct`, `/api/direct`, `/api/v1/direct`
+
+Search accepts `q`, `query`, or `term`. Media routes accept `url`, `video_id`, `videoId`, `id`, `link`, or `youtube_url`. Plain YouTube video IDs are accepted.
+
+`/download?url=...` returns JSON with absolute `download_url`, `file_url`, `stream_url`, and `url` aliases. `/download?url=...&type=audio` returns a fast HTTP redirect to the signed audio stream; `type=video` returns the video file.
+
+The API is public by default so bots that cannot send custom headers work immediately. To protect it, set `REQUIRE_API_KEY=true` and configure `API_KEY`; clients may send `X-API-Key`, `Authorization: Bearer`, or `api_key`.
 
 ## Health check
-
-After deployment:
 
 ```text
 https://YOUR-APP-NAME.herokuapp.com/health
 ```
-
-## Important
-
-Heroku's dyno filesystem is ephemeral. `downloads/` and `cache.db` can be removed when the dyno restarts or is redeployed. Use external object storage/database if downloaded files or cache must persist.
-
-`cookies.txt` is intentionally not committed to this package. The app downloads it at startup from `COOKIE_URL` when that Config Var is set.
-
-## API Key Authentication (v2.3.0)
-
-The API now protects `/search`, `/thumbnail`, `/download`, `/video`, and `/files/{filename}` with an API key.
-
-### 1. Create a strong API key
-
-On Windows PowerShell:
-
-```powershell
-[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }))
-```
-
-Or use any cryptographically random 32+ character secret.
-
-### 2. Add it to Heroku
-
-```bash
-heroku config:set API_KEY="YOUR_GENERATED_KEY" --app music-api-021d06c29284
-```
-
-Do not put the key in GitHub or share it publicly.
-
-### 3. Use the key from your Music Bot
-
-Send the key in the HTTP header:
-
-```text
-X-API-Key: YOUR_GENERATED_KEY
-```
-
-A Bearer token is also accepted:
-
-```text
-Authorization: Bearer YOUR_GENERATED_KEY
-```
-
-### Public endpoints
-
-`GET /` and `GET /health` remain public so uptime/health checkers can verify that the API is online.
-
-### Protected endpoints
-
-- `GET /search`
-- `GET /thumbnail`
-- `GET /download`
-- `GET /video`
-- `GET /files/{filename}`
-
-Without a valid key these return HTTP `401`.
-If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.
-
-## FAST AUDIO MODE
-For the fastest `/download?type=audio` path, set:
-- `YOUTUBE_USE_COOKIES=true`
-- `COOKIE_URL=<your privately hosted cookies.txt URL>` (recommended when YouTube challenges the dyno)
-- `YOUTUBE_PLAYER_CLIENTS=default`
-
-The audio endpoint resolves a signed YouTube media URL and returns a 302 redirect; it does not wait for a complete MP3 download or FFmpeg conversion.
