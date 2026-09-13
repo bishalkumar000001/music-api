@@ -91,3 +91,9 @@ Distributed under the MIT License.
 ## API Authentication
 
 Protected API endpoints require the `X-API-Key` header. Configure `API_KEY` in your hosting environment. `/` and `/health` remain public.
+
+## Telegram bot compatibility
+
+The API keeps the original endpoints and also exposes `/api/*` and `/api/v1/*` aliases. Search accepts `q`, `query`, or `term`; media routes accept `url`, `video_id`, `videoId`, `id`, `link`, or `youtube_url`. Download responses include absolute `download_url`, `file_url`, `stream_url`, and `url` aliases.
+
+For Heroku, keep cookies out of Git and configure `YOUTUBE_COOKIES_B64` or a private `COOKIE_URL`. Public compatibility is enabled by default; set `REQUIRE_API_KEY=true` when all clients can send authentication.
