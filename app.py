@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import time
 import asyncio
 import sqlite3
@@ -9,7 +10,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security
+from fastapi import FastAPI, HTTPException, Query, Header, Depends, Security, Request
 from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +55,17 @@ PORT = int(
     )
 )
 
-COOKIE_URL = os.getenv("COOKIE_URL", "")
+COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
+COOKIE_URLS = [
+    value.strip()
+    for value in os.getenv("COOKIE_URLS", COOKIE_URL).replace(",", "\n").splitlines()
+    if value.strip()
+]
+
+# Cookie files should be supplied through Heroku Config Vars or a private URL,
+# never committed to Git. Base64 avoids multiline Config Var formatting issues.
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
+YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
 
 # YouTube player clients. Avoid the deprecated/problematic tv_downgraded
 # client that can cause "The page needs to be reloaded" errors.
@@ -71,7 +82,7 @@ YOUTUBE_USE_COOKIES = os.getenv(
     "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-COOKIES_FILE = "cookies.txt"
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt").strip() or "cookies.txt"
 
 DB_FILE = "cache.db"
 
@@ -84,6 +95,11 @@ DB_FILE = "cache.db"
 # For compatibility, ?api_key=<your-key> is also accepted.
 
 API_KEY = os.getenv("API_KEY", "").strip()
+REQUIRE_API_KEY = os.getenv(
+    "REQUIRE_API_KEY",
+    "false"
+).strip().lower() in ("1", "true", "yes", "on")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 # Expose the header in Swagger UI so protected endpoints can be tested
 # with the Authorize button. Query and Bearer authentication remain supported.
@@ -96,6 +112,11 @@ async def require_api_key(
     api_key: Optional[str] = Query(default=None, description="API key (legacy/query compatibility)")
 ):
     """Protect API endpoints with a server-side API key."""
+
+    # Public-by-default keeps compatibility with Telegram bots that cannot
+    # attach custom headers. Set REQUIRE_API_KEY=true for a private API.
+    if not REQUIRE_API_KEY:
+        return True
 
     if not API_KEY:
         logger.error("API_KEY is not configured on the server.")
@@ -606,6 +627,61 @@ async def cache_cleanup_task():
         )
 
 
+def _write_cookie_content(content: str, source: str) -> bool:
+    """Atomically write a cookie export without logging its contents."""
+    content = (content or "").lstrip("\ufeff")
+    if len(content.strip()) < 20:
+        raise ValueError("cookie export is empty or too short")
+
+    directory = os.path.dirname(os.path.abspath(COOKIES_FILE))
+    os.makedirs(directory, exist_ok=True)
+    temporary_file = COOKIES_FILE + ".tmp"
+    with open(temporary_file, "w", encoding="utf-8", newline="") as cookie_file:
+        cookie_file.write(content)
+        if not content.endswith("\n"):
+            cookie_file.write("\n")
+    os.replace(temporary_file, COOKIES_FILE)
+    logger.info("Loaded cookies from %s", source)
+    return True
+
+
+def load_cookie_file() -> bool:
+    """Load cookies from Config Vars or private URLs at process startup."""
+    if YOUTUBE_COOKIES_B64:
+        try:
+            decoded = base64.b64decode(YOUTUBE_COOKIES_B64, validate=True).decode("utf-8")
+            return _write_cookie_content(decoded, "YOUTUBE_COOKIES_B64")
+        except Exception as exc:
+            logger.error("Failed to decode YOUTUBE_COOKIES_B64: %s", exc)
+
+    if YOUTUBE_COOKIES.strip():
+        try:
+            return _write_cookie_content(YOUTUBE_COOKIES, "YOUTUBE_COOKIES")
+        except Exception as exc:
+            logger.error("Failed to load YOUTUBE_COOKIES: %s", exc)
+
+    for cookie_url in COOKIE_URLS:
+        try:
+            request = urllib.request.Request(
+                cookie_url,
+                headers={"User-Agent": "music-api-cookie-loader/1.0"}
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                content = response.read(10 * 1024 * 1024 + 1)
+            if len(content) > 10 * 1024 * 1024:
+                raise ValueError("cookie export is larger than 10 MB")
+            return _write_cookie_content(content.decode("utf-8"), cookie_url)
+        except Exception as exc:
+            logger.error("Failed to download cookies from %s: %s", cookie_url, exc)
+
+    if os.path.isfile(COOKIES_FILE):
+        logger.info("Using existing cookie file at %s", COOKIES_FILE)
+        return True
+
+    logger.warning("No cookie file configured; continuing without YouTube cookies")
+    return False
+
+
 # =========================================================
 # FASTAPI LIFESPAN
 # =========================================================
@@ -623,26 +699,8 @@ async def lifespan(app: FastAPI):
     # Download cookies
     # -----------------------------------------
 
-    if COOKIE_URL:
-
-        try:
-
-            urllib.request.urlretrieve(
-                COOKIE_URL,
-                COOKIES_FILE
-            )
-
-            logger.info(
-                "Successfully downloaded "
-                "cookies.txt from COOKIE_URL"
-            )
-
-        except Exception as e:
-
-            logger.error(
-                f"Failed to download cookies "
-                f"from COOKIE_URL: {e}"
-            )
+    if YOUTUBE_USE_COOKIES:
+        load_cookie_file()
 
     # -----------------------------------------
     # Start cleanup worker
@@ -1733,6 +1791,35 @@ def download_video_sync(
         )
 
 
+def _first_nonempty(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _public_url(request: Request, path: str) -> str:
+    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return base + (path if path.startswith("/") else "/" + path)
+
+
+def _compat_payload(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    """Add stable absolute URL aliases used by older Telegram music bots."""
+    result = dict(payload)
+    download_url = result.get("download_url")
+    if isinstance(download_url, str):
+        if download_url.startswith("/"):
+            download_url = _public_url(request, download_url)
+        result["download_url"] = download_url
+        result.setdefault("file_url", download_url)
+        result.setdefault("stream_url", download_url)
+        result.setdefault("url", download_url)
+    if result.get("videoId"):
+        result.setdefault("id", result["videoId"])
+        result.setdefault("video_id", result["videoId"])
+    return result
+
+
 # =========================================================
 # ROOT — DEVELOPER PORTAL
 # =========================================================
@@ -1776,15 +1863,16 @@ async def health_check():
 # SEARCH
 # =========================================================
 
+@app.get("/api/v1/search")
+@app.get("/api/search")
 @app.get("/search")
 async def search_youtube_music(
 
     _: bool = Depends(require_api_key),
 
-    q: str = Query(
-        ...,
-        description="Search query"
-    ),
+    q: Optional[str] = Query(default=None, description="Search query"),
+    query: Optional[str] = Query(default=None, description="Search query alias"),
+    term: Optional[str] = Query(default=None, description="Search query alias"),
 
     limit: int = Query(
         1,
@@ -1795,9 +1883,13 @@ async def search_youtube_music(
 
     try:
 
+        search_query = _first_nonempty(q, query, term)
+        if not search_query:
+            raise HTTPException(status_code=400, detail="q or query is required")
+
         logger.info(
             f"Received search request "
-            f"for query '{q}' "
+            f"for query '{search_query}' "
             f"with limit {limit}"
         )
 
@@ -1809,7 +1901,7 @@ async def search_youtube_music(
             20
         )
 
-        cache_key = f"{q.strip().casefold()}::{actual_limit}"
+        cache_key = f"{search_query.casefold()}::{actual_limit}"
         cached_results = _get_search_cached(cache_key)
         if cached_results is not None:
             if actual_limit == 1:
@@ -1819,7 +1911,7 @@ async def search_youtube_music(
         def perform_search():
 
             return ytmusic.search(
-                q,
+                search_query,
                 filter="songs",
                 limit=actual_limit
             )
@@ -1873,14 +1965,17 @@ async def search_youtube_music(
                     r.get("duration"),
 
                 "thumbnail":
-                    thumbnail_url
+                    thumbnail_url,
+                "id": r.get("videoId"),
+                "url": f"https://www.youtube.com/watch?v={r.get('videoId')}" if r.get("videoId") else None,
+                "video_url": f"https://www.youtube.com/watch?v={r.get('videoId')}" if r.get("videoId") else None
             })
 
         _set_search_cached(cache_key, formatted_results)
 
         logger.info(
             f"Successfully completed search "
-            f"for query '{q}', "
+            f"for query '{search_query}', "
             f"returned "
             f"{len(formatted_results)} "
             f"result(s)"
@@ -1896,10 +1991,13 @@ async def search_youtube_music(
 
         return formatted_results
 
+    except HTTPException:
+        raise
+
     except Exception as e:
 
         logger.error(
-            f"Search error for query '{q}': {e}"
+            f"Search error for query '{search_query}': {e}"
         )
 
         raise HTTPException(
@@ -1919,25 +2017,36 @@ async def search_youtube_music(
 # THUMBNAIL API
 # =========================================================
 
+@app.get("/api/v1/thumbnail")
+@app.get("/api/thumbnail")
 @app.get("/thumbnail")
 async def get_thumbnail(
 
     _: bool = Depends(require_api_key),
 
-    url: str = Query(
-        ...,
-        description="YouTube URL"
-    )
+
+    url: Optional[str] = Query(default=None, description="YouTube URL or video ID"),
+    video_id: Optional[str] = Query(default=None, alias="video_id"),
+    video_id_camel: Optional[str] = Query(default=None, alias="videoId"),
+    media_id: Optional[str] = Query(default=None, alias="id"),
+    link: Optional[str] = Query(default=None),
+    youtube_url: Optional[str] = Query(default=None, alias="youtube_url")
 ):
 
     try:
 
+        media_input = _first_nonempty(url, video_id, video_id_camel, media_id, link, youtube_url)
+        if not media_input:
+            raise HTTPException(status_code=400, detail="url or video_id is required")
         result = await asyncio.to_thread(
             fetch_thumbnail_sync,
-            url
+            media_input
         )
 
         return result
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
@@ -1962,13 +2071,27 @@ async def get_thumbnail(
 # DIRECT AUDIO API
 # =========================================================
 
+@app.get("/api/v1/direct")
+@app.get("/api/direct")
 @app.get("/direct")
 async def direct_audio(
     _: bool = Depends(require_api_key),
-    url: str = Query(..., description="YouTube URL or video ID")
+
+    url: Optional[str] = Query(default=None, description="YouTube URL or video ID"),
+    video_id: Optional[str] = Query(default=None, alias="video_id"),
+    video_id_camel: Optional[str] = Query(default=None, alias="videoId"),
+    media_id: Optional[str] = Query(default=None, alias="id"),
+    link: Optional[str] = Query(default=None),
+    youtube_url: Optional[str] = Query(default=None, alias="youtube_url")
 ):
     try:
-        return JSONResponse(await asyncio.to_thread(resolve_direct_audio_sync, url))
+        media_input = _first_nonempty(url, video_id, video_id_camel, media_id, link, youtube_url)
+        if not media_input:
+            raise HTTPException(status_code=400, detail="url or video_id is required")
+        return JSONResponse(await asyncio.to_thread(resolve_direct_audio_sync, media_input))
+    except HTTPException:
+        raise
+
     except Exception as e:
         logger.error("Direct audio API error: %s", e)
         raise HTTPException(status_code=500, detail={"error": "Direct audio failed", "message": str(e)})
@@ -1978,15 +2101,22 @@ async def direct_audio(
 # AUDIO DOWNLOAD API
 # =========================================================
 
+@app.get("/api/v1/download")
+@app.get("/api/download")
 @app.get("/download")
 async def download_audio(
 
+    request: Request,
+
     _: bool = Depends(require_api_key),
 
-    url: str = Query(
-        ...,
-        description="YouTube URL or video ID"
-    ),
+
+    url: Optional[str] = Query(default=None, description="YouTube URL or video ID"),
+    video_id: Optional[str] = Query(default=None, alias="video_id"),
+    video_id_camel: Optional[str] = Query(default=None, alias="videoId"),
+    media_id: Optional[str] = Query(default=None, alias="id"),
+    link: Optional[str] = Query(default=None),
+    youtube_url: Optional[str] = Query(default=None, alias="youtube_url"),
 
     type: Optional[str] = Query(
         default=None,
@@ -1995,6 +2125,10 @@ async def download_audio(
 ):
 
     try:
+
+        media_input = _first_nonempty(url, video_id, video_id_camel, media_id, link, youtube_url)
+        if not media_input:
+            raise HTTPException(status_code=400, detail="url or video_id is required")
 
         requested_type = (type or "").strip().lower()
         if requested_type not in ("", "audio", "video"):
@@ -2008,7 +2142,7 @@ async def download_audio(
         # HTTP clients normally follow the redirect automatically, so playback/download
         # starts immediately instead of waiting for a full MP3 conversion.
         if requested_type == "audio":
-            result = await asyncio.to_thread(resolve_direct_audio_sync, url)
+            result = await asyncio.to_thread(resolve_direct_audio_sync, media_input)
             return RedirectResponse(
                 url=result["url"],
                 status_code=302,
@@ -2023,12 +2157,12 @@ async def download_audio(
         if requested_type == "video":
             result = await asyncio.to_thread(
                 download_video_sync,
-                url
+                media_input
             )
         else:
             result = await asyncio.to_thread(
                 download_audio_sync,
-                url
+                media_input
             )
 
         if requested_type:
@@ -2045,8 +2179,11 @@ async def download_audio(
             )
 
         return JSONResponse(
-            content=result
+            content=_compat_payload(result, request)
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
@@ -2071,27 +2208,40 @@ async def download_audio(
 # VIDEO DOWNLOAD API
 # =========================================================
 
+@app.get("/api/v1/video")
+@app.get("/api/video")
 @app.get("/video")
 async def download_video(
 
+    request: Request,
+
     _: bool = Depends(require_api_key),
 
-    url: str = Query(
-        ...,
-        description="YouTube URL"
-    )
+
+    url: Optional[str] = Query(default=None, description="YouTube URL or video ID"),
+    video_id: Optional[str] = Query(default=None, alias="video_id"),
+    video_id_camel: Optional[str] = Query(default=None, alias="videoId"),
+    media_id: Optional[str] = Query(default=None, alias="id"),
+    link: Optional[str] = Query(default=None),
+    youtube_url: Optional[str] = Query(default=None, alias="youtube_url")
 ):
 
     try:
 
+        media_input = _first_nonempty(url, video_id, video_id_camel, media_id, link, youtube_url)
+        if not media_input:
+            raise HTTPException(status_code=400, detail="url or video_id is required")
         result = await asyncio.to_thread(
             download_video_sync,
-            url
+            media_input
         )
 
         return JSONResponse(
-            content=result
+            content=_compat_payload(result, request)
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
